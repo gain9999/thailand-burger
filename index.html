@@ -184,11 +184,33 @@
     }
     .sidebar-chart {
       width: 100%;
+      position: relative;
     }
     .sidebar-chart canvas {
       width: 100%;
       height: auto;
       display: block;
+    }
+    .chart-tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: rgba(17, 29, 74, 0.92);
+      color: #ffffff;
+      padding: 6px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      line-height: 1.3;
+      box-shadow: 0 8px 18px rgba(15, 23, 42, 0.25);
+      transform: translate(-50%, -110%);
+      opacity: 0;
+      transition: opacity 0.12s ease;
+      white-space: nowrap;
+    }
+    .chart-tooltip[hidden] {
+      display: none;
+    }
+    .chart-tooltip[data-visible="true"] {
+      opacity: 1;
     }
     #selectionControls {
       display: flex;
@@ -292,7 +314,7 @@
     }
     .rainfall-popup .leaflet-popup-content {
       margin: 8px 12px;
-      width: 340px !important;
+      max-width: 340px !important;
     }
     @media (max-width: 900px) {
       #sidebarToggle {
@@ -391,9 +413,10 @@
 
       <div class="info-block" id="chartBlock" hidden>
         <h2>Return Period Profile</h2>
-        <div id="chartLocationLabel" class="info-line">Click the map to plot intensities.</div>
+        <div id="chartLocationLabel" class="info-line">Click the map, a gauge, or a river site to plot intensities.</div>
         <div class="sidebar-chart">
           <canvas id="sidebarChart" width="320" height="200"></canvas>
+          <div id="chartTooltip" class="chart-tooltip" hidden></div>
         </div>
       </div>
 
@@ -423,7 +446,7 @@
       <div class="info-block">
         <h2>Point Value</h2>
         <div class="info-line"><strong>Hover:</strong> <span id="hoverInfo">Move the cursor over the map.</span></div>
-        <div class="info-line"><strong>Selection:</strong> <span id="selectionInfo">Use the search box or click the map.</span></div>
+        <div class="info-line"><strong>Selection:</strong> <span id="selectionInfo">Use the search box, click the map, or select a gauge or river site.</span></div>
       </div>
 
       <div id="colorbar" class="info-block">
@@ -435,17 +458,23 @@
         </div>
       </div>
       <div class="info-block" id="opacityControl">
-        <h2>Layer Opacity</h2>
+        <h2>Layer Opacity (current: <span id="opacityValue">0.75</span>)</h2>
         <input type="range" id="opacitySlider" min="0.2" max="1" step="0.05" value="0.75" />
         <div class="slider-row">
-          <span>Current opacity:</span>
-          <span id="opacityValue">0.75</span>
         </div>
       </div>
       <div id="citation">
-        Data source:<br />
+        Data sources:<br />
         <a href="https://doi.org/10.5281/zenodo.15473689" target="_blank" rel="noopener">
-          Hoch, J. (2025) “BURGER - A bottom-up regionalization approach for global sub-daily intensity-duration-frequency data”, Water Resources Research.
+          Hoch (2025) BURGER global IDF dataset, Water Resour. Res.
+        </a>
+        <br />
+        <a href="https://doi.org/10.2166/wcc.2023.430" target="_blank" rel="noopener">
+          Yamoat et al. (2023) Scaling IDF rainfall in Thailand, Journal of Water and Climate Change.
+        </a>
+        <br />
+        <a href="https://colab.research.google.com/drive/1FnXXSEQqU1TJhMPiNeWUTr9LnbJwZzMm?usp=sharing#scrollTo=UTbokLLWp_9o" target="_blank" rel="noopener">
+          Google Runoff Reanalysis &amp; Reforecast (GRRR) dataset.
         </a>
       </div>
     </aside>
@@ -471,6 +500,7 @@
       variables: {},
       map: null,
       cells: [],
+      gridLayer: null,
       currentVariable: null,
       currentScale: null,
       highlightCell: null,
@@ -482,6 +512,26 @@
       selectedDuration: null,
       selectedReturnPeriod: null,
       selectedPoint: null,
+      selectedGauge: null,
+      selectedGaugeMarker: null,
+      selectedRiver: null,
+      layersControl: null,
+      gaugeLayer: null,
+      gaugeData: [],
+      gaugePane: null,
+      riverLayer: null,
+      riverData: [],
+      riverPane: null,
+      gaugeRenderer: null,
+      riverRenderer: null,
+      chartData: null,
+      chartPoints: [],
+      chartHoverIndex: null,
+      chartCanvas: null,
+      chartCanvasCtx: null,
+      chartTooltipEl: null,
+      chartContainer: null,
+      chartInteractionReady: false,
     };
 
     const BASE_COLORS = ["#0050FF", "#00FF7F", "#FFE600", "#FF4A00", "#9B00FF"];
@@ -496,6 +546,9 @@
     async function init() {
       setupMap();
       setupSidebarToggle();
+      setupChartInteraction();
+      loadGaugeLocations();
+      loadRiverStations();
       try {
         const dataset = await fetchDataset();
         state.dataset = dataset;
@@ -517,19 +570,64 @@
       const map = L.map("map", {
         preferCanvas: true,
         attributionControl: true,
-      }).setView([15, 101], 6);
+      }).setView([15, 101], 7);
 
       const osmLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
         maxZoom: 19,
         attribution: "&copy; OpenStreetMap contributors",
       });
       osmLayer.addTo(map);
-      L.control.layers({ "OpenStreetMap": osmLayer }, null, { collapsed: true }).addTo(map);
+      const baseLayers = { "OpenStreetMap": osmLayer };
+      const overlayLayers = {};
+      const layersControl = L.control.layers(baseLayers, overlayLayers, { collapsed: true }).addTo(map);
 
       map.on("mousemove", (evt) => handleHover(evt.latlng));
       map.on("click", (evt) => highlightLocation(evt.latlng.lat, evt.latlng.lng, { pan: false, fromClick: true }));
 
+      const gaugePane = map.createPane("gaugePane");
+      gaugePane.style.zIndex = 650;
+      gaugePane.style.pointerEvents = "auto";
+      const riverPane = map.createPane("riverPane");
+      riverPane.style.zIndex = 655;
+      riverPane.style.pointerEvents = "auto";
+      const gaugeRenderer = L.svg({ pane: "gaugePane" }).addTo(map);
+      const riverRenderer = L.svg({ pane: "riverPane" }).addTo(map);
+      map.on("overlayremove", (evt) => {
+        if (evt.layer === state.gaugeLayer && state.selectedGauge) {
+          state.selectedGauge = null;
+          state.selectedGaugeMarker = null;
+          refreshSelectionInfo();
+          updateSidebarChart();
+        }
+        if (evt.layer === state.riverLayer && state.selectedRiver) {
+          state.selectedRiver = null;
+          refreshSelectionInfo();
+          updateSidebarChart();
+        }
+        if (evt.layer === state.gridLayer) {
+          hideGridLayer();
+        }
+      });
+
+      map.on("overlayadd", (evt) => {
+        if (evt.layer === state.gaugeLayer) {
+          bringOverlayToFront("gauge");
+        }
+        if (evt.layer === state.riverLayer) {
+          bringOverlayToFront("river");
+        }
+        if (evt.layer === state.gridLayer) {
+          showGridLayer();
+          bringOverlayToFront("grid");
+        }
+      });
+
       state.map = map;
+      state.layersControl = layersControl;
+      state.gaugePane = gaugePane;
+      state.riverPane = riverPane;
+      state.gaugeRenderer = gaugeRenderer;
+      state.riverRenderer = riverRenderer;
       setTimeout(() => map.invalidateSize(), 50);
     }
 
@@ -539,6 +637,409 @@
         throw new Error(`Unable to fetch dataset file (status ${response.status})`);
       }
       return response.json();
+    }
+
+    async function loadGaugeLocations() {
+      if (state.gaugeLayer) return;
+      try {
+        const response = await fetch("thailand_gauge_IDF.csv");
+        if (!response.ok) {
+          throw new Error(`Unable to fetch gauge file (status ${response.status})`);
+        }
+        const csvText = await response.text();
+        const gauges = parseGaugeCSV(csvText);
+        if (!gauges.length) {
+          console.warn("Gauge CSV parsed but no gauge records were found.");
+          return;
+        }
+        const markers = gauges.map(createGaugeMarker).filter(Boolean);
+        if (!markers.length) {
+          console.warn("Gauge markers were not created due to invalid coordinates.");
+          return;
+        }
+        const gaugeLayer = L.layerGroup(markers);
+        state.gaugeLayer = gaugeLayer;
+        state.gaugeData = gauges;
+        if (state.layersControl) {
+          state.layersControl.addOverlay(gaugeLayer, "Gauge Stations");
+        }
+        if (state.map) {
+          gaugeLayer.addTo(state.map);
+        }
+      } catch (error) {
+        console.error("Failed to load gauge locations.", error);
+      }
+    }
+
+    function parseGaugeCSV(csvText) {
+      if (!csvText) return [];
+      const lines = csvText.trim().split(/\r?\n/);
+      if (lines.length <= 1) return [];
+      const headers = lines[0].split(",");
+      const stationIdx = headers.indexOf("station");
+      const latIdx = headers.indexOf("lat");
+      const lonIdx = headers.indexOf("lon");
+      if (stationIdx === -1 || latIdx === -1 || lonIdx === -1) {
+        console.warn("Gauge CSV is missing required columns.");
+        return [];
+      }
+      const intensityColumns = headers
+        .map((header, idx) => ({ header: header.trim(), idx }))
+        .filter(({ header }) => /^I_/i.test(header))
+        .map(({ header, idx }) => {
+          const meta = parseGaugeIntensityHeader(header);
+          if (!meta) return null;
+          return { idx, ...meta };
+        })
+        .filter(Boolean);
+
+      const gauges = [];
+      for (let i = 1; i < lines.length; i += 1) {
+        const rawLine = lines[i];
+        if (!rawLine) continue;
+        const parts = rawLine.split(",");
+        if (parts.length <= Math.max(stationIdx, latIdx, lonIdx)) continue;
+        const station = parts[stationIdx]?.trim();
+        const lat = parseFloat(parts[latIdx]);
+        const lon = parseFloat(parts[lonIdx]);
+        if (!station || Number.isNaN(lat) || Number.isNaN(lon)) continue;
+        const intensities = {};
+        intensityColumns.forEach(({ idx, durationKey, returnPeriodKey }) => {
+          if (idx >= parts.length) return;
+          const value = parseFloat(parts[idx]);
+          if (!Number.isFinite(value)) return;
+          if (!intensities[durationKey]) {
+            intensities[durationKey] = {};
+          }
+          intensities[durationKey][returnPeriodKey] = value;
+        });
+        gauges.push({ station, lat, lon, intensities });
+      }
+      return gauges;
+    }
+
+    function createGaugeMarker(gauge) {
+      if (!gauge) return null;
+      const { lat, lon, station } = gauge;
+      if (Number.isNaN(lat) || Number.isNaN(lon)) return null;
+      const markerOptions = {
+        radius: 6,
+        color: "#111827",
+        weight: 2,
+        fillColor: "#1f2937",
+        fillOpacity: 0.7,
+        bubblingMouseEvents: false,
+        riseOnHover: true,
+      };
+      if (state.gaugePane) {
+        markerOptions.pane = "gaugePane";
+      }
+      if (state.gaugeRenderer) {
+        markerOptions.renderer = state.gaugeRenderer;
+      }
+      const marker = L.circleMarker([lat, lon], markerOptions);
+      marker.on("add", () => {
+        const el = marker.getElement();
+        if (el) {
+          el.style.cursor = "pointer";
+        }
+      });
+      marker.bindPopup("");
+      marker.on("click", (evt) => {
+        if (evt && typeof L !== "undefined" && L.DomEvent && evt.originalEvent) {
+          L.DomEvent.stop(evt.originalEvent);
+        }
+        handleGaugeClick(gauge, marker);
+        marker.setPopupContent(buildGaugePopupContent(gauge));
+        marker.openPopup();
+      });
+      return marker;
+    }
+
+    async function loadRiverStations() {
+      if (state.riverLayer) return;
+      try {
+        const response = await fetch("GRRR_thailand_river_discharge_rps.json");
+        if (!response.ok) {
+          throw new Error(`Unable to fetch river discharge file (status ${response.status})`);
+        }
+        const raw = await response.json();
+        const rivers = parseRiverDataset(raw);
+        if (!rivers.length) {
+          console.warn("River discharge dataset was loaded but no river records were parsed.");
+          return;
+        }
+        const markers = rivers.map(createRiverMarker).filter(Boolean);
+        if (!markers.length) {
+          console.warn("River markers were not created due to invalid coordinates.");
+          return;
+        }
+        const riverLayer = L.layerGroup(markers);
+        state.riverLayer = riverLayer;
+        state.riverData = rivers;
+        if (state.layersControl) {
+          state.layersControl.addOverlay(riverLayer, "River Basins");
+        }
+        if (state.map) {
+          riverLayer.addTo(state.map);
+        }
+      } catch (error) {
+        console.error("Failed to load river discharge stations.", error);
+      }
+    }
+
+    function parseRiverDataset(raw) {
+      if (!raw || typeof raw !== "object") return [];
+      const rivers = [];
+      Object.entries(raw).forEach(([id, entry]) => {
+        if (!entry || typeof entry !== "object") return;
+        const lat = parseFloat(entry.latitude ?? entry.lat ?? entry.Latitude);
+        const lon = parseFloat(entry.longitude ?? entry.lon ?? entry.Longitude);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+        const returnPeriods = {};
+        Object.entries(entry).forEach(([key, value]) => {
+          const match = /^rp(\d+)/i.exec(key);
+          if (!match) return;
+          const rpNumber = Number(match[1]);
+          if (!Number.isFinite(rpNumber)) return;
+          const numericValue = Number(value);
+          if (!Number.isFinite(numericValue)) return;
+          const label = `${rpNumber}yr`;
+          returnPeriods[label] = numericValue;
+        });
+        if (!Object.keys(returnPeriods).length) return;
+        const name = id;
+        rivers.push({
+          id,
+          name,
+          lat,
+          lon,
+          returnPeriods,
+          units: "m³/s",
+        });
+      });
+      return rivers;
+    }
+
+    function createRiverMarker(river) {
+      if (!river) return null;
+      const { lat, lon, name } = river;
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+      const markerOptions = {
+        radius: 6,
+        color: "#2563eb",
+        weight: 2,
+        fillColor: "#60a5fa",
+        fillOpacity: 0.4,
+        bubblingMouseEvents: false,
+        riseOnHover: true,
+      };
+      if (state.riverPane) {
+        markerOptions.pane = "riverPane";
+      }
+      if (state.riverRenderer) {
+        markerOptions.renderer = state.riverRenderer;
+      }
+      const marker = L.circleMarker([lat, lon], markerOptions);
+      marker.on("add", () => {
+        const el = marker.getElement();
+        if (el) {
+          el.style.cursor = "pointer";
+        }
+      });
+      marker.bindPopup(`
+        <div class="popup-content">
+          <div>River basin: <strong>${name}</strong></div>
+          <div>${lat.toFixed(3)}°N, ${lon.toFixed(3)}°E</div>
+          <div>(See discharge plot)</div>
+        </div>
+      `);
+      marker.on("click", (evt) => {
+        if (evt && typeof L !== "undefined" && L.DomEvent && evt.originalEvent) {
+          L.DomEvent.stop(evt.originalEvent);
+        }
+        handleRiverClick(river);
+        marker.openPopup();
+      });
+      return marker;
+    }
+
+    function parseGaugeIntensityHeader(header) {
+      if (!header) return null;
+      const parts = header.split("_");
+      if (parts.length < 3) return null;
+      const durationToken = parts[1];
+      const returnToken = parts[2];
+      const durationKey = normalizeGaugeDurationToken(durationToken);
+      const returnPeriodKey = normalizeGaugeReturnToken(returnToken);
+      if (!durationKey || !returnPeriodKey) return null;
+      return { durationKey, returnPeriodKey };
+    }
+
+    function normalizeGaugeDurationToken(token) {
+      if (!token) return null;
+      let normalizedToken = token.toLowerCase();
+      if (normalizedToken.endsWith("h")) {
+        normalizedToken = normalizedToken.slice(0, -1).replace(/p/g, ".");
+        if (!normalizedToken) return null;
+        const numeric = Number(normalizedToken);
+        if (!Number.isFinite(numeric)) return null;
+        const text = Number.isInteger(numeric) ? numeric.toString() : numeric.toString();
+        return `${text}hr`;
+      }
+      return null;
+    }
+
+    function normalizeGaugeReturnToken(token) {
+      if (!token) return null;
+      const numericPart = token.replace(/[^0-9.]/g, "");
+      if (!numericPart) return null;
+      const numeric = Number(numericPart);
+      if (!Number.isFinite(numeric)) return null;
+      const text = Number.isInteger(numeric) ? numeric.toString() : numeric.toString();
+      return `${text}yr`;
+    }
+
+    function handleGaugeClick(gauge, marker = null) {
+      if (!gauge) return;
+      state.selectedGauge = gauge;
+      state.selectedGaugeMarker = marker || state.selectedGaugeMarker;
+      state.selectedPoint = null;
+      state.selectedRiver = null;
+      if (state.highlightCell && state.map) {
+        state.map.removeLayer(state.highlightCell);
+        state.highlightCell = null;
+      }
+      document.getElementById("searchFeedback").textContent = "";
+      const locationText = `${gauge.lat.toFixed(2)}°N, ${gauge.lon.toFixed(2)}°E`;
+      refreshSelectionInfo(`Gauge station ${gauge.station} (${locationText})`);
+      updateSidebarChart();
+    }
+
+    function buildGaugeSeries(gauge, durationKey) {
+      if (!gauge || !durationKey) {
+        return { labels: [], values: [] };
+      }
+      const durationData = gauge.intensities?.[durationKey];
+      if (!durationData) {
+        return { labels: [], values: [] };
+      }
+      const entries = Object.entries(durationData)
+        .filter(([, value]) => Number.isFinite(value))
+        .map(([label, value]) => ({ label, value }));
+      if (!entries.length) {
+        return { labels: [], values: [] };
+      }
+      entries.sort((a, b) => compareReturnPeriod(a.label, b.label));
+      return {
+        labels: entries.map((entry) => entry.label),
+        values: entries.map((entry) => entry.value),
+      };
+    }
+
+    function getGaugeValue(gauge) {
+      if (!gauge) return null;
+      const durations = gauge.intensities || {};
+      const durationKeys = Object.keys(durations);
+      if (!durationKeys.length) {
+        return { durationKey: state.selectedDuration || DEFAULT_DURATION, returnKey: state.selectedReturnPeriod || "n/a", value: null };
+      }
+
+      let durationKey = null;
+      if (state.selectedDuration && durations[state.selectedDuration]) {
+        durationKey = state.selectedDuration;
+      } else {
+        durationKeys.sort(compareDuration);
+        durationKey = durationKeys[0];
+      }
+
+      const rpMap = durations[durationKey] || {};
+      const rpKeys = Object.keys(rpMap);
+      if (!rpKeys.length) {
+        return { durationKey, returnKey: state.selectedReturnPeriod || "n/a", value: null };
+      }
+
+      let returnKey = null;
+      if (state.selectedReturnPeriod && rpMap[state.selectedReturnPeriod] != null) {
+        returnKey = state.selectedReturnPeriod;
+      } else if (state.selectedReturnPeriod) {
+        returnKey = state.selectedReturnPeriod;
+      } else {
+        rpKeys.sort(compareReturnPeriod);
+        returnKey = rpKeys[0];
+      }
+
+      const value = rpMap[returnKey];
+      return { durationKey, returnKey, value };
+    }
+
+    function buildGaugePopupContent(gauge) {
+      if (!gauge) {
+        return "";
+      }
+      const info = getGaugeValue(gauge);
+      const durationLabel = info?.durationKey || state.selectedDuration || DEFAULT_DURATION;
+      const returnLabel = info?.returnKey || state.selectedReturnPeriod || "n/a";
+      const value = info?.value;
+      const unitsLabel = defaultUnits;
+      const valueText = value == null ? "no data" : `${value.toFixed(2)} ${unitsLabel}`;
+      return `
+        <div class="popup-content">
+          <div>Rain gauge: <strong>${gauge.station}</strong></div>
+          <div>${gauge.lat.toFixed(3)}°N, ${gauge.lon.toFixed(3)}°E</div>
+          <div><strong>${durationLabel} – ${returnLabel}</strong></div>
+          <div>Value: ${valueText}</div>
+        </div>
+      `;
+    }
+
+    function updateGaugePopup() {
+      const marker = state.selectedGaugeMarker;
+      const gauge = state.selectedGauge;
+      if (!marker || !gauge) return;
+      const content = buildGaugePopupContent(gauge);
+      if (!content) return;
+      if (marker.getPopup()) {
+        marker.setPopupContent(content);
+        if (marker.isPopupOpen && marker.isPopupOpen()) {
+          marker.openPopup();
+        }
+      } else {
+        marker.bindPopup(content);
+      }
+    }
+
+    function handleRiverClick(river) {
+      if (!river) return;
+      state.selectedRiver = river;
+      state.selectedGauge = null;
+      state.selectedGaugeMarker = null;
+      state.selectedPoint = null;
+      if (state.highlightCell && state.map) {
+        state.map.removeLayer(state.highlightCell);
+        state.highlightCell = null;
+      }
+      document.getElementById("searchFeedback").textContent = "";
+      const locationText = `${river.lat.toFixed(2)}°N, ${river.lon.toFixed(2)}°E`;
+      refreshSelectionInfo(`River basin ${river.name} (${locationText})`);
+      updateSidebarChart();
+    }
+
+    function buildRiverSeries(river) {
+      if (!river) {
+        return { labels: [], values: [] };
+      }
+      const entries = Object.entries(river.returnPeriods || {})
+        .filter(([, value]) => Number.isFinite(value))
+        .map(([label, value]) => ({ label, value }));
+      if (!entries.length) {
+        return { labels: [], values: [] };
+      }
+      entries.sort((a, b) => compareReturnPeriod(a.label, b.label));
+      return {
+        labels: entries.map((entry) => entry.label),
+        values: entries.map((entry) => entry.value),
+      };
     }
 
     function normalizeUnits(units) {
@@ -671,6 +1172,34 @@
       applyVariableColors(state.currentVariable);
     }
 
+    function showGridLayer() {
+      if (!state.gridLayer || !state.map) return;
+      if (!state.map.hasLayer(state.gridLayer)) {
+        state.gridLayer.addTo(state.map);
+      }
+      refreshCellOpacity();
+    }
+
+    function hideGridLayer() {
+      if (!state.gridLayer || !state.map) return;
+      state.gridLayer.removeFrom(state.map);
+    }
+
+    function bringOverlayToFront(type) {
+      if (!state.map) return;
+      if (type === "gauge" && state.gaugePane) {
+        state.gaugePane.style.zIndex = 650;
+      }
+      if (type === "river" && state.riverPane) {
+        state.riverPane.style.zIndex = 655;
+      }
+      if (type === "grid" && state.gridLayer) {
+        state.gridLayer.eachLayer((layer) => {
+          if (layer.bringToBack) layer.bringToBack();
+        });
+      }
+    }
+
     function setupSidebarToggle() {
       const toggle = document.getElementById("sidebarToggle");
       const scrim = document.getElementById("scrim");
@@ -756,6 +1285,118 @@
       handleResize();
     }
 
+    function setupChartInteraction() {
+      if (state.chartInteractionReady) return;
+      const canvas = document.getElementById("sidebarChart");
+      const tooltip = document.getElementById("chartTooltip");
+      if (!canvas || !tooltip) return;
+      const container = canvas.parentElement;
+      if (!container) return;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      state.chartCanvas = canvas;
+      state.chartCanvasCtx = ctx;
+      state.chartTooltipEl = tooltip;
+      state.chartContainer = container;
+      canvas.addEventListener("mousemove", handleChartMouseMove);
+      canvas.addEventListener("mouseleave", handleChartMouseLeave);
+      state.chartInteractionReady = true;
+    }
+
+    function handleChartMouseMove(event) {
+      if (!state.chartData || !state.chartPoints.length || !state.chartCanvas) {
+        hideChartTooltip();
+        return;
+      }
+      const canvas = state.chartCanvas;
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.clientWidth > 0 ? canvas.clientWidth / canvas.width : 1;
+      const scaleY = canvas.clientHeight > 0 ? canvas.clientHeight / canvas.height : 1;
+      const canvasX = (event.clientX - rect.left) / scaleX;
+      const canvasY = (event.clientY - rect.top) / scaleY;
+      const index = getChartHoverIndex(canvasX, canvasY);
+      if (index == null) {
+        if (state.chartHoverIndex != null) {
+          state.chartHoverIndex = null;
+          renderCurrentChart();
+        }
+        hideChartTooltip();
+        return;
+      }
+      if (state.chartHoverIndex !== index) {
+        state.chartHoverIndex = index;
+        renderCurrentChart();
+      }
+      showChartTooltip(index);
+    }
+
+    function handleChartMouseLeave() {
+      if (state.chartHoverIndex != null) {
+        state.chartHoverIndex = null;
+        renderCurrentChart();
+      }
+      hideChartTooltip();
+    }
+
+    function getChartHoverIndex(canvasX, canvasY) {
+      const points = state.chartPoints || [];
+      if (!points.length) return null;
+      let closestIndex = null;
+      let closestDistance = Infinity;
+      const threshold = 12;
+      for (let idx = 0; idx < points.length; idx += 1) {
+        const pt = points[idx];
+        const dx = canvasX - pt.x;
+        const dy = canvasY - pt.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        if (distance < closestDistance) {
+          closestDistance = distance;
+          closestIndex = idx;
+        }
+      }
+      return closestDistance <= threshold ? closestIndex : null;
+    }
+
+    function showChartTooltip(index) {
+      const tooltip = state.chartTooltipEl;
+      const container = state.chartContainer;
+      const canvas = state.chartCanvas;
+      const data = state.chartData;
+      if (!tooltip || !container || !canvas || !data) return;
+      if (index == null || index < 0 || index >= data.labels.length) {
+        hideChartTooltip();
+        return;
+      }
+      const point = state.chartPoints[index];
+      if (!point) return;
+      const scaleX = canvas.clientWidth > 0 ? canvas.clientWidth / canvas.width : 1;
+      const scaleY = canvas.clientHeight > 0 ? canvas.clientHeight / canvas.height : 1;
+      const left = point.x * scaleX;
+      const top = point.y * scaleY;
+      tooltip.style.left = `${left}px`;
+      tooltip.style.top = `${top}px`;
+      const units = data.unitsLabel || defaultUnits;
+      const rawValue = data.values[index];
+      const valueText = Number.isFinite(rawValue) ? rawValue.toFixed(2) : "n/a";
+      const labelText = data.labels[index];
+      tooltip.textContent = `${labelText}: ${valueText} ${units}`;
+      tooltip.hidden = false;
+      tooltip.setAttribute("data-visible", "true");
+    }
+
+    function hideChartTooltip() {
+      const tooltip = state.chartTooltipEl;
+      if (!tooltip) return;
+      tooltip.hidden = true;
+      tooltip.removeAttribute("data-visible");
+      tooltip.textContent = "";
+    }
+
+    function renderCurrentChart() {
+      if (!state.chartCanvasCtx || !state.chartData) return;
+      state.chartPoints = renderLineChart(state.chartCanvasCtx, state.chartData, state.chartHoverIndex);
+    }
+
     function updateReturnSelectOptions() {
       const returnSelect = document.getElementById("returnSelect");
       const duration = state.selectedDuration;
@@ -785,12 +1426,14 @@
       updateReturnSelectOptions();
       updateVariableFromSelection();
       updateSidebarChart();
+      updateGaugePopup();
     }
 
     function handleReturnPeriodChange(event) {
       state.selectedReturnPeriod = event.target.value;
       updateVariableFromSelection();
       updateSidebarChart();
+      updateGaugePopup();
     }
 
     function renderPopupContent(info, unitsLabel) {
@@ -805,6 +1448,9 @@
     }
 
     function setSelectedPoint(info) {
+      state.selectedGauge = null;
+      state.selectedGaugeMarker = null;
+      state.selectedRiver = null;
       state.selectedPoint = {
         latIdx: info.latIdx,
         lonIdx: info.lonIdx,
@@ -828,10 +1474,32 @@
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
 
-      if (!state.selectedPoint) {
+      if (!state.chartInteractionReady) {
+        setupChartInteraction();
+      }
+
+      state.chartCanvas = canvas;
+      state.chartCanvasCtx = ctx;
+      state.chartContainer = canvas.parentElement || state.chartContainer;
+      if (!state.chartTooltipEl) {
+        const tooltip = document.getElementById("chartTooltip");
+        if (tooltip) {
+          state.chartTooltipEl = tooltip;
+        }
+      }
+
+      const river = state.selectedRiver;
+      const gauge = state.selectedGauge;
+      const point = state.selectedPoint;
+
+      if (!river && !gauge && !point) {
         block.hidden = true;
-        labelEl.textContent = "Click the map to plot intensities.";
+        labelEl.textContent = "Click the map, a gauge, or a river site to plot intensities.";
         ctx.clearRect(0, 0, canvas.width, canvas.height);
+        state.chartData = null;
+        state.chartPoints = [];
+        state.chartHoverIndex = null;
+        hideChartTooltip();
         return;
       }
 
@@ -839,18 +1507,71 @@
       ensureChartCanvasSize(canvas);
       ctx.fillStyle = "#ffffff";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
+      state.chartHoverIndex = null;
+      hideChartTooltip();
 
-      const { latIdx, lonIdx, lat, lon } = state.selectedPoint;
+      if (river) {
+        const dataset = buildRiverSeries(river);
+        if (!dataset.labels.length) {
+          labelEl.textContent = `River basin ${river.name}: no discharge data`;
+          state.chartData = null;
+          state.chartPoints = [];
+          drawPlaceholderMessage(ctx, "River discharge data unavailable");
+          return;
+        }
+        const unitsLabel = river.units || "m³/s";
+        labelEl.textContent = `River discharge (${unitsLabel}) profile at "${river.name}"`;
+        state.chartData = {
+          labels: dataset.labels,
+          values: dataset.values,
+          unitsLabel,
+          source: { type: "river", name: river.name },
+        };
+        state.chartPoints = renderLineChart(ctx, state.chartData, state.chartHoverIndex);
+        return;
+      }
+
+      if (gauge) {
+        const durationKey = state.selectedDuration || DEFAULT_DURATION;
+        const dataset = buildGaugeSeries(gauge, durationKey);
+        if (!dataset.labels.length) {
+          labelEl.textContent = `Gauge station ${gauge.station}: no data for ${durationKey}`;
+          state.chartData = null;
+          state.chartPoints = [];
+          drawPlaceholderMessage(ctx, "Gauge data unavailable for this duration");
+          return;
+        }
+        const unitsLabel = defaultUnits;
+        labelEl.textContent = `${durationKey} rainfall (${unitsLabel}) profile at "${gauge.station}" gauge station`;
+        state.chartData = {
+          labels: dataset.labels,
+          values: dataset.values,
+          unitsLabel,
+          source: { type: "gauge", name: gauge.station },
+        };
+        state.chartPoints = renderLineChart(ctx, state.chartData, state.chartHoverIndex);
+        return;
+      }
+
+      const { latIdx, lonIdx, lat, lon } = point;
       const dataset = gatherDurationSeries(state.selectedDuration, latIdx, lonIdx);
       if (!dataset.labels.length) {
         labelEl.textContent = `No data for ${state.selectedDuration} at ${lat.toFixed(2)}°N, ${lon.toFixed(2)}°E`;
+        state.chartData = null;
+        state.chartPoints = [];
         drawPlaceholderMessage(ctx, "No data for this duration");
         return;
       }
 
       const unitsLabel = state.currentUnits || defaultUnits;
       labelEl.textContent = `${state.selectedDuration} rainfall (${unitsLabel}) profile at ${lat.toFixed(2)}°N, ${lon.toFixed(2)}°E`;
-      renderLineChart(ctx, dataset.labels, dataset.values, unitsLabel);
+      state.chartData = {
+        labels: dataset.labels,
+        values: dataset.values,
+        unitsLabel,
+        source: { type: "grid", lat, lon },
+      };
+      state.chartPoints = renderLineChart(ctx, state.chartData, state.chartHoverIndex);
     }
 
     function ensureChartCanvasSize(canvas) {
@@ -873,7 +1594,12 @@
       ctx.fillText(message, ctx.canvas.width / 2, ctx.canvas.height / 2);
     }
 
-    function renderLineChart(ctx, labels, values, unitsLabel) {
+    function renderLineChart(ctx, data, hoverIndex = null) {
+      if (!data || !Array.isArray(data.labels) || !Array.isArray(data.values) || !data.labels.length || !data.values.length) {
+        ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+        return [];
+      }
+      const { labels, values } = data;
       const width = ctx.canvas.width;
       const height = ctx.canvas.height;
       ctx.clearRect(0, 0, width, height);
@@ -929,6 +1655,29 @@
         ctx.fill();
       });
 
+      if (hoverIndex != null && hoverIndex >= 0 && hoverIndex < points.length) {
+        const hoverPoint = points[hoverIndex];
+        ctx.save();
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = "rgba(47, 111, 221, 0.45)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(hoverPoint.x, paddingTop);
+        ctx.lineTo(hoverPoint.x, paddingTop + plotHeight);
+        ctx.stroke();
+        ctx.restore();
+
+        ctx.save();
+        ctx.fillStyle = "#f97316";
+        ctx.beginPath();
+        ctx.arc(hoverPoint.x, hoverPoint.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "#ffffff";
+        ctx.stroke();
+        ctx.restore();
+      }
+
       ctx.fillStyle = "#243b53";
       ctx.font = "11px sans-serif";
       ctx.textAlign = "center";
@@ -960,6 +1709,7 @@
           ctx.fillText(`${midVal.toFixed(1)}`, paddingLeft - 8, paddingTop + plotHeight / 2);
         }
       }
+      return points;
     }
 
     function gatherDurationSeries(duration, latIdx, lonIdx) {
@@ -1039,16 +1789,16 @@
         const latCenter = state.lat[i];
         const latNorth = latCenter + halfLat;
         const latSouth = latCenter - halfLat;
-        for (let j = 0; j < lonCount; j += 1) {
-          const lonCenter = state.lon[j];
-          const lonWest = lonCenter - halfLon;
-          const lonEast = lonCenter + halfLon;
-          const layer = L.rectangle(
-            [
-              [latSouth, lonWest],
-              [latNorth, lonEast],
-            ],
-            {
+      for (let j = 0; j < lonCount; j += 1) {
+        const lonCenter = state.lon[j];
+        const lonWest = lonCenter - halfLon;
+        const lonEast = lonCenter + halfLon;
+        const layer = L.rectangle(
+          [
+            [latSouth, lonWest],
+            [latNorth, lonEast],
+          ],
+          {
               stroke: false,
               fillOpacity: 0,
               fillColor: "#ffffff",
@@ -1061,6 +1811,13 @@
       }
 
       state.cells = cells;
+      if (!state.gridLayer) {
+        state.gridLayer = L.layerGroup(cells.map((cell) => cell.layer));
+        if (state.layersControl) {
+          state.layersControl.addOverlay(state.gridLayer, "Rainfall Grid");
+        }
+        state.gridLayer.addTo(map);
+      }
     }
 
     async function setVariable(name) {
@@ -1171,11 +1928,14 @@
     }
 
     function refreshSelectionInfo(message) {
-      document.getElementById("selectionInfo").textContent = message || "Use the search box or click the map.";
+      document.getElementById("selectionInfo").textContent = message || "Use the search box, click the map, or select a gauge or river site.";
     }
 
     function highlightLocation(lat, lon, { pan = true, fromClick = false } = {}) {
       if (!state.currentVariable) return;
+      state.selectedGauge = null;
+      state.selectedGaugeMarker = null;
+      state.selectedRiver = null;
       const info = getCellInfo(lat, lon);
       if (!info || !info.withinBounds) {
         const feedback = lat.toFixed && lon.toFixed ? `Location ${lat.toFixed(2)}, ${lon.toFixed(2)} is outside the data extent.` : "Outside data extent.";
@@ -1337,5 +2097,4 @@
       window.addEventListener("scroll", hidePopover, true);
     }
   </script>
-</body>
-</html>
+</body></html>
