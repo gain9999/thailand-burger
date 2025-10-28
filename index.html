@@ -542,6 +542,39 @@
         .scale(BASE_COLORS)
         .mode("lab")
         .domain([min, max]);
+    const MARKER_RADIUS = {
+      min: 6,
+      max: 40,
+      growStartZoom: 9,
+      growEndZoom: 14,
+    };
+
+    function computeMarkerRadius(zoom) {
+      if (!Number.isFinite(zoom)) return MARKER_RADIUS.min;
+      if (zoom <= MARKER_RADIUS.growStartZoom) return MARKER_RADIUS.min;
+      if (zoom >= MARKER_RADIUS.growEndZoom) return MARKER_RADIUS.max;
+      const range = MARKER_RADIUS.max - MARKER_RADIUS.min;
+      const zoomProgress =
+        (zoom - MARKER_RADIUS.growStartZoom) /
+        (MARKER_RADIUS.growEndZoom - MARKER_RADIUS.growStartZoom);
+      return MARKER_RADIUS.min + range * zoomProgress;
+    }
+
+    function updateMarkerSizes() {
+      if (!state.map) return;
+      const zoom = state.map.getZoom();
+      const radius = computeMarkerRadius(zoom);
+      const adjustLayerMarkers = (layerGroup) => {
+        if (!layerGroup || typeof layerGroup.eachLayer !== "function") return;
+        layerGroup.eachLayer((layer) => {
+          if (layer && typeof layer.setRadius === "function") {
+            layer.setRadius(radius);
+          }
+        });
+      };
+      adjustLayerMarkers(state.gaugeLayer);
+      adjustLayerMarkers(state.riverLayer);
+    }
 
     async function init() {
       setupMap();
@@ -612,9 +645,11 @@
       map.on("overlayadd", (evt) => {
         if (evt.layer === state.gaugeLayer) {
           bringOverlayToFront("gauge");
+          updateMarkerSizes();
         }
         if (evt.layer === state.riverLayer) {
           bringOverlayToFront("river");
+          updateMarkerSizes();
         }
         if (evt.layer === state.gridLayer) {
           showGridLayer();
@@ -628,6 +663,8 @@
       state.riverPane = riverPane;
       state.gaugeRenderer = gaugeRenderer;
       state.riverRenderer = riverRenderer;
+      map.on("zoomend", updateMarkerSizes);
+      map.whenReady(() => updateMarkerSizes());
       setTimeout(() => map.invalidateSize(), 50);
     }
 
@@ -665,6 +702,7 @@
         }
         if (state.map) {
           gaugeLayer.addTo(state.map);
+          updateMarkerSizes();
         }
       } catch (error) {
         console.error("Failed to load gauge locations.", error);
@@ -723,7 +761,7 @@
       const { lat, lon, station } = gauge;
       if (Number.isNaN(lat) || Number.isNaN(lon)) return null;
       const markerOptions = {
-        radius: 6,
+        radius: computeMarkerRadius(state.map ? state.map.getZoom() : undefined),
         color: "#111827",
         weight: 2,
         fillColor: "#1f2937",
@@ -782,6 +820,7 @@
         }
         if (state.map) {
           riverLayer.addTo(state.map);
+          updateMarkerSizes();
         }
       } catch (error) {
         console.error("Failed to load river discharge stations.", error);
@@ -826,7 +865,7 @@
       const { lat, lon, name } = river;
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
       const markerOptions = {
-        radius: 6,
+        radius: computeMarkerRadius(state.map ? state.map.getZoom() : undefined),
         color: "#2563eb",
         weight: 2,
         fillColor: "#60a5fa",
